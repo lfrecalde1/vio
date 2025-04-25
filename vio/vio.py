@@ -19,6 +19,7 @@ class VIONode(Node):
         # Load configuration and dataset
         self.config = ConfigEuRoC()
         self.img_queue = Queue()
+        self.ground_true_queue = Queue()
         self.imu_queue = Queue()
         self.feature_queue = Queue()
 
@@ -40,12 +41,18 @@ class VIONode(Node):
         self.img_publisher = DataPublisher(
             self.dataset.stereo, self.img_queue, float('inf'), ratio=0.4)
 
+        self.ground_true_publisher = DataPublisher(
+            self.dataset.groundtruth, self.ground_true_queue, float('inf'), ratio=0.4)
+
+        self.ground_true_data = None
         # Start IMU processing thread
         self.img_thread = Thread(target=self.process_img, daemon=True)
         self.imu_thread = Thread(target=self.process_imu, daemon=True)
+        self.ground_true_thread = Thread(target=self.process_true, daemon=True)
         self.feature_thread = Thread(target=self.process_feature, daemon=True)
 
         self.imu_thread.start()
+        self.ground_true_thread.start()
         self.img_thread.start()
         self.feature_thread.start()
 
@@ -53,6 +60,7 @@ class VIONode(Node):
         now = self.get_clock().now().nanoseconds * 1e-9
         self.imu_publisher.start(now)
         self.img_publisher.start(now)
+        self.ground_true_publisher.start(now)
 
     def process_img(self):
         while True:
@@ -72,10 +80,18 @@ class VIONode(Node):
                 break
 
             self.image_processor.imu_callback(imu_msg)
-            self.msckf.imu_callback(imu_msg)
+            self.msckf.imu_callback(imu_msg, self.ground_true_data)
 
             # Publish both transforms
             self.publish_transforms()
+
+    def process_true(self):
+        while rclpy.ok():
+            true_msg = self.ground_true_queue.get()
+            if true_msg is None:
+                break
+            self.ground_true_data = true_msg
+            self.publish_ground_true(true_msg)
 
     def process_feature(self):
         while True:
@@ -86,15 +102,33 @@ class VIONode(Node):
             print('feature_msg', feature_msg.timestamp)
             result = self.msckf.feature_callback(feature_msg)
 
+    def publish_ground_true(self, msg):
+        q = msg.q
+        t = msg.p
+        tf_world_imu = TransformStamped()
+        tf_world_imu.header.stamp = self.get_clock().now().to_msg()
+        tf_world_imu.header.frame_id = 'world'            # <-- world is the parent
+        tf_world_imu.child_frame_id = 'vicon'          # <-- imu_link is rotated
+        tf_world_imu.transform.translation.x = t[0]
+        tf_world_imu.transform.translation.y = t[1]
+        tf_world_imu.transform.translation.z = t[2]
+        tf_world_imu.transform.rotation.x = q[1]
+        tf_world_imu.transform.rotation.y = q[2]
+        tf_world_imu.transform.rotation.z = q[3]
+        tf_world_imu.transform.rotation.w = q[0]
+
+        #self.tf_broadcaster.sendTransform([tf_world_imu, tf_imu_cam, tf_cam0_cam1, tf_imu_cam1])
+        self.tf_broadcaster.sendTransform([tf_world_imu])
+
 
     def publish_transforms(self):
         tf_world_imu = TransformStamped()
         tf_world_imu.header.stamp = self.get_clock().now().to_msg()
         tf_world_imu.header.frame_id = 'world'            # <-- world is the parent
         tf_world_imu.child_frame_id = 'imu_link'          # <-- imu_link is rotated
-        tf_world_imu.transform.translation.x = 1.0
-        tf_world_imu.transform.translation.y = 1.0
-        tf_world_imu.transform.translation.z = 0.0
+        tf_world_imu.transform.translation.x = self.msckf.state_server.imu_state.position[0]
+        tf_world_imu.transform.translation.y = self.msckf.state_server.imu_state.position[1]
+        tf_world_imu.transform.translation.z = self.msckf.state_server.imu_state.position[2]
         tf_world_imu.transform.rotation.x = self.msckf.state_server.imu_state.orientation[0]
         tf_world_imu.transform.rotation.y = self.msckf.state_server.imu_state.orientation[1]
         tf_world_imu.transform.rotation.z = self.msckf.state_server.imu_state.orientation[2]
@@ -109,6 +143,7 @@ class VIONode(Node):
             return
 
         t = self.msckf.state_server.imu_state.t_cam0_imu
+        t_aux = self.msckf.state_server.imu_state.t_imu_cam0
 
         tf_imu_cam = TransformStamped()
         tf_imu_cam.header.stamp = self.get_clock().now().to_msg()
