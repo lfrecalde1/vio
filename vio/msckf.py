@@ -5,6 +5,7 @@ from vio import Feature
 
 import time
 from collections import namedtuple
+from scipy.stats import chi2
 from scipy.spatial.transform import Rotation as R
 
 
@@ -116,8 +117,7 @@ class MSCKF(object):
         # Initialize the chi squared test table with confidence level 0.95.
         self.chi_squared_test_table = dict()
         for i in range(1, 100):
-            #self.chi_squared_test_table[i] = chi2.ppf(0.05, i)
-            None
+            self.chi_squared_test_table[i] = chi2.ppf(0.05, i)
 
         # Set the initial IMU state.
         # The intial orientation and position will be set to the origin implicitly.
@@ -178,7 +178,7 @@ class MSCKF(object):
         self.t_cam1_imu = T_cam1_imu[:3, 3]
 
         # Tracking rate.
-        self.tracking_rate = None
+        self.tracking_rate = 0
 
         # Indicate if the gravity vector is set.
         self.is_gravity_set = False
@@ -391,7 +391,6 @@ class MSCKF(object):
             n = self.state_server.state_cov.shape[1]
             self.state_server.state_cov[0:21, 21:n] = PHI @ self.state_server.state_cov[0:21, 21:n]
             self.state_server.state_cov[21:n, 0:21] = self.state_server.state_cov[21:n, 0:21] @ PHI.T
-            print("----------------------UPDATING COVARIANCE--------------------------")
 
 
         self.state_server.state_cov = 0.5 * (self.state_server.state_cov + self.state_server.state_cov.T)
@@ -515,41 +514,48 @@ class MSCKF(object):
         J[3:6, 12:15] = np.eye(3)
         J[3:6, 18:21] = R_t
 
+        old_rows, old_cols = self.state_server.state_cov.shape
+        new_state_cov = np.zeros((old_rows + 6, old_cols + 6))
 
+        new_state_cov[:old_rows, :old_cols] = self.state_server.state_cov
+        self.state_server.state_cov = new_state_cov
 
-        # Get the imu_state, rotation from imu to cam0, and translation from cam0 to imu
-        ...
+        P11 = self.state_server.state_cov[:21, :21]      # 21x21 block (IMU part)
+        P12 = self.state_server.state_cov[:21, 21:old_cols]  # 21x(N-21) block (IMU-to-camera part)
 
-        # Add a new camera state to the state server.
-        ...
-        
+        self.state_server.state_cov[old_rows:old_rows+6, :old_cols] = J @ np.hstack((P11, P12))
+        self.state_server.state_cov[:old_rows, old_cols:old_cols+6] = (J @ np.hstack((P11, P12))).T
+        self.state_server.state_cov[old_rows:old_rows+6, old_cols:old_cols+6] = J @ P11 @ J.T
 
-        # Update the covariance matrix of the state.
-        # To simplify computation, the matrix J below is the nontrivial block
-        # Appendix B of "MSCKF" paper.
-        ...
-
-        # Resize the state covariance matrix.
-        ...
-
-        # Fill in the augmented state covariance.
-        ...
-
-        # Fix the covariance to be symmetric
-        ...
+        # Enforce symmetry
+        self.state_server.state_cov = 0.5 * (self.state_server.state_cov + self.state_server.state_cov.T)
 
     def add_feature_observations(self, feature_msg):
         """
         IMPLEMENT THIS!!!!!
         """
         # get the current imu state id and number of current features
-        ...
-        
-        # add all features in the feature_msg to self.map_server
-        ...
+        state_id = self.state_server.imu_state.id
+        curr_feature_num = len(self.map_server)
+        tracked_feature_num = 0
 
-        # update the tracking rate
-        ...
+        for feature in feature_msg.features:
+            if feature.id not in self.map_server:
+                # New feature
+                self.map_server[feature.id] = Feature(feature.id)
+                self.map_server[feature.id].observations[state_id] = np.array([feature.u0, feature.v0, feature.u1, feature.v1])
+            else:
+                # Existing feature
+                self.map_server[feature.id].observations[state_id] = np.array([feature.u0, feature.v0, feature.u1, feature.v1])
+                tracked_feature_num += 1
+
+        # Update tracking rate
+         # Update tracking rate
+        if curr_feature_num > 0:
+            self.tracking_rate = tracked_feature_num / curr_feature_num
+        else:
+            self.tracking_rate = 0.0
+        return None
 
     def measurement_jacobian(self, cam_state_id, feature_id):
         """
@@ -807,7 +813,6 @@ class MSCKF(object):
             distance = np.linalg.norm(position - key_position)
             angle = 2 * np.arccos(to_quaternion(
                 rotation @ key_rotation.T)[-1])
-
             if angle < 0.2618 and distance < 0.4 and self.tracking_rate > 0.5:
                 rm_cam_state_ids.append(cam_state_pairs[cam_state_idx][0])
                 cam_state_idx += 1
@@ -906,6 +911,7 @@ class MSCKF(object):
                 size = state_cov.shape[0]
                 state_cov[cam_state_start:-6, :] = state_cov[cam_state_end:, :]
                 state_cov[:, cam_state_start:-6] = state_cov[:, cam_state_end:]
+
             self.state_server.state_cov = state_cov[:-6, :-6]
 
             # Remove this camera state in the state vector.
@@ -922,6 +928,8 @@ class MSCKF(object):
         state_cov[15:18, 15:18] = self.config.extrinsic_rotation_cov * np.identity(3)
         state_cov[18:21, 18:21] = self.config.extrinsic_translation_cov * np.identity(3)
         self.state_server.state_cov = state_cov
+        print("Reset COV")
+        print(self.state_server.state_cov.shape)
 
     def reset(self):
         """
@@ -960,6 +968,8 @@ class MSCKF(object):
 
         # Check the uncertainty of positions to determine if 
         # the system can be reset.
+        print("-----------------xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx------------------------")
+        print(self.state_server.state_cov.shape)
         position_x_std = np.sqrt(self.state_server.state_cov[12, 12])
         position_y_std = np.sqrt(self.state_server.state_cov[13, 13])
         position_z_std = np.sqrt(self.state_server.state_cov[14, 14])

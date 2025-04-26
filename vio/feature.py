@@ -89,10 +89,10 @@ class Feature(object):
 
         # Compute the weight based on the residual.
         e = np.linalg.norm(r)
-        if e <= self.optimization_config.huber_epsilon:
+        if e <= 0.01:
             w = 1.0
         else:
-            w = self.optimization_config.huber_epsilon / (2*e)
+            w = 0.01 / (2*e)
 
         return J, r, w
 
@@ -133,7 +133,7 @@ class Feature(object):
             True if the translation between the input camera poses 
                 is sufficient. (bool)
         """
-        if self.optimization_config.translation_threshold < 0:
+        if 0.2 < 0:
             return True
 
         observation_ids = list(self.observations.keys())
@@ -162,7 +162,7 @@ class Feature(object):
         orthogonal_translation = translation - parallel * feature_direction
 
         return (np.linalg.norm(orthogonal_translation) > 
-            self.optimization_config.translation_threshold)
+            0.2)
 
     def initialize_position(self, cam_states):
         """
@@ -218,7 +218,7 @@ class Feature(object):
         solution = np.array([*initial_position[:2], 1.0]) / initial_position[2]
 
         # Apply Levenberg-Marquart method to solve for the 3d position.
-        lambd = self.optimization_config.initial_damping
+        lambd = 1e-3
         inner_loop_count = 0
         outer_loop_count = 0
         is_cost_reduced = False
@@ -231,10 +231,7 @@ class Feature(object):
             total_cost += self.cost(cam_pose, solution, measurement)
 
         # Outer loop.
-        while (outer_loop_count < 
-            self.optimization_config.outer_loop_max_iteration
-            and delta_norm > 
-            self.optimization_config.estimation_precision):
+        while (outer_loop_count < 5 and delta_norm > 5e-7):
 
             A = np.zeros((3, 3))
             b = np.zeros(3)
@@ -249,9 +246,7 @@ class Feature(object):
 
             # Inner loop.
             # Solve for the delta that can reduce the total cost.
-            while (inner_loop_count < 
-                self.optimization_config.inner_loop_max_iteration
-                and not is_cost_reduced):
+            while (inner_loop_count < 5 and not is_cost_reduced):
 
                 delta = np.linalg.solve(A + lambd * np.identity(3), b)   # vec3
                 new_solution = solution - delta
