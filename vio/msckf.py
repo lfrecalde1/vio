@@ -147,11 +147,8 @@ class MSCKF(object):
 
         # Transformation between the IMU and the left camera (cam0)
         T_cam0_imu = np.linalg.inv(config.T_imu_cam0)
-        T_imu_cam0 = (config.T_imu_cam0)
-
-        self.state_server.imu_state.R_cam0_imu = T_cam0_imu[:3, :3]
+        self.state_server.imu_state.R_cam0_imu = T_cam0_imu[:3, :3].T
         self.state_server.imu_state.t_cam0_imu = T_cam0_imu[:3, 3]
-        self.state_server.imu_state.t_imu_cam0 = T_imu_cam0[:3, 3]
 
 
         ## Init state_server imu gyro bias
@@ -159,7 +156,7 @@ class MSCKF(object):
 
 
         # Extrinsic parameters of camera and IMU.
-        T_cam0_cam1 = np.linalg.inv(config.T_cn_cnm1)
+        T_cam0_cam1 = config.T_cn_cnm1
         CAMState.R_cam0_cam1 = T_cam0_cam1[:3, :3]
         CAMState.t_cam0_cam1 = T_cam0_cam1[:3, 3]
 
@@ -174,7 +171,7 @@ class MSCKF(object):
             config.T_imu_body[:3, 3])
         
         T_cam1_imu = np.linalg.inv(config.T_imu_cam1)
-        self.R_cam1_imu = T_cam1_imu[:3, :3]
+        self.R_cam1_imu = T_cam1_imu[:3, :3].T
         self.t_cam1_imu = T_cam1_imu[:3, 3]
 
         # Tracking rate.
@@ -278,9 +275,10 @@ class MSCKF(object):
         gravity_norm = np.linalg.norm(gravity_imu)
         IMUState.gravity = np.array([0, 0, -gravity_norm], dtype=np.double)
 
-        q0_iw = from_two_vectors(gravity_imu, -IMUState.gravity)
+        q0_iw = from_two_vectors(-IMUState.gravity, gravity_imu)
         R0_iw = to_rotation(q0_iw)
-        self.state_server.imu_state.orientation = to_quaternion(R0_iw.T)
+        #self.state_server.imu_state.orientation = to_quaternion(R0_iw.T)
+        self.state_server.imu_state.orientation = q0_iw
         return None
 
     def batch_imu_processing(self, time_bound):
@@ -309,7 +307,8 @@ class MSCKF(object):
         
         # Set the current imu id to be the IMUState.next_id
         print(self.state_server.imu_state.id)
-        self.state_server.imu_state.id = self.state_server.imu_state.id + 1
+        self.state_server.imu_state.id = IMUState.next_id
+        IMUState.next_id = IMUState.next_id+ 1
 
         # Remove all used IMU msgs.
         del self.imu_msg_buffer[:used_imu_msg_cntr]
@@ -326,7 +325,7 @@ class MSCKF(object):
         imu_state = self.state_server.imu_state
         gyro = m_gyro - imu_state.gyro_bias
         acc = m_acc - imu_state.acc_bias
-        dt = time - imu_state.timestamp
+        dt = (time - imu_state.timestamp)
 
         # Compute discrete transition F, Q matrices in Appendix A in "MSCKF" paper
         F = np.zeros((21, 21), dtype=np.double)
@@ -338,14 +337,14 @@ class MSCKF(object):
 
         F[0:3, 0:3] = -skew(gyro)
         F[0:3, 3:6] = -np.eye(3)
-        F[6:9, 0:3] = -rotation@skew(acc)
-        F[6:9, 9:12] = -rotation
+        F[6:9, 0:3] = -to_rotation(imu_state.orientation).T @ skew(acc)
+        F[6:9, 9:12] = -to_rotation(imu_state.orientation).T
         F[12:15, 6:9] = np.eye(3)
 
 
         G[0:3, 0:3] = - np.eye(3)
         G[3:6, 3:6] = np.eye(3)
-        G[6:9, 6:9] = -rotation
+        G[6:9, 6:9] = -to_rotation(imu_state.orientation).T
         G[9:12, 9:12] = np.eye(3)
 
         # Aproximation of matrix exponential
@@ -357,30 +356,33 @@ class MSCKF(object):
         
         # Approximate matrix exponential to the 3rd order, which can be 
         # considered to be accurate enough assuming dt is within 0.01s.
-        PHI = np.eye(21) + Fdt + (1/2)*Fdt_square + (1/6)*Fdt_cube
+        PHI = np.eye(21) + Fdt + (1/2)*Fdt_square + (1/6.0)*Fdt_cube
 
         # Propogate the state using 4th order Runge-Kutta
         self.predict_new_state(dt, gyro, acc)
+
+        
         # Modify the transition matrix
         q_null_object = R.from_quat(self.state_server.imu_state.orientation_null)
-        R_kk_1 = q_null_object.as_matrix()
+        R_kk_1 = to_rotation(imu_state.orientation_null)
 
         q_object = R.from_quat(self.state_server.imu_state.orientation)
         R_t = q_object.as_matrix()
-        PHI[0:3, 0:3] = R_t.T@R_kk_1
+        PHI[0:3, 0:3] = to_rotation(imu_state.orientation) @ R_kk_1.T
 
-        u = R_kk_1.T @ imu_state.gravity
+        u = R_kk_1 @ IMUState.gravity
         u = u.reshape((3, 1))
+        #s = u / (u @ u)
         s = np.linalg.inv((u.T @ u)) @ u.T
 
         A1 = PHI[6:9, 0:3]
-        w1 = skew(imu_state.velocity_null - imu_state.velocity) @ imu_state.gravity
+        w1 = skew(imu_state.velocity_null - imu_state.velocity) @ IMUState.gravity
         w1 = w1.reshape((3, 1))
 
         PHI[6:9, 0:3] = A1 - (A1 @ u - w1)@s
 
         A2 = PHI[12:15, 0:3]
-        w2 = skew(dt*imu_state.velocity_null + imu_state.position_null - imu_state.position) @ imu_state.gravity
+        w2 = skew(dt*imu_state.velocity_null + imu_state.position_null - imu_state.position) @ IMUState.gravity
         w2 = w2.reshape((3, 1))
         PHI[12:15, 0:3] = A2 - (A2 @ u - w2)@s
 
@@ -389,8 +391,8 @@ class MSCKF(object):
 
         if self.state_server.cam_states:
             n = self.state_server.state_cov.shape[1]
-            self.state_server.state_cov[0:21, 21:n] = PHI @ self.state_server.state_cov[0:21, 21:n]
-            self.state_server.state_cov[21:n, 0:21] = self.state_server.state_cov[21:n, 0:21] @ PHI.T
+            self.state_server.state_cov[:21, 21:] = PHI @ self.state_server.state_cov[:21, 21:]
+            self.state_server.state_cov[21:, :21] = self.state_server.state_cov[21:, :21] @ PHI.T
 
 
         self.state_server.state_cov = 0.5 * (self.state_server.state_cov + self.state_server.state_cov.T)
@@ -437,8 +439,8 @@ class MSCKF(object):
             dR_dt = dq_dt.as_matrix()
             dR_dt2 = dq_dt2.as_matrix()
         else:
-            dq_dt = (np.eye(4) + 0.5 * dt * Omega) @ q
-            dq_dt2 = (np.eye(4) + 0.25 * dt * Omega) @ q
+            dq_dt = (np.eye(4) + 0.5*dt*Omega) * np.cos(gyro_norm*dt*0.5) @ q
+            dq_dt2 = (np.eye(4) + 0.25*dt*Omega) * np.cos(gyro_norm*dt*0.25) @ q
 
             dq_dt = R.from_quat(dq_dt)
             dq_dt2 = R.from_quat(dq_dt2)
@@ -468,7 +470,6 @@ class MSCKF(object):
         k4_p_dot = k3_v
 
         # Update state
-        print("--------------------------------------------------------------------------------")
         self.state_server.imu_state.orientation = quaternion_normalize(dq_dt.as_quat())
         self.state_server.imu_state.velocity = v + (dt / 6) * (k1_v_dot + 2 * k2_v_dot + 2 * k3_v_dot + k4_v_dot)
         self.state_server.imu_state.position = p + (dt / 6) * (k1_p_dot + 2 * k2_p_dot + 2 * k3_p_dot + k4_p_dot)
@@ -567,12 +568,22 @@ class MSCKF(object):
         feature = self.map_server[feature_id]
 
         # Cam0 pose.
-        R_w_c0 = to_rotation(cam_state.orientation)
+        q_w_c0 = R.from_quat(cam_state.orientation)
+        R_w_c0 = q_w_c0.as_matrix()
         t_c0_w = cam_state.position
 
-        # Cam1 pose.
-        R_w_c1 = CAMState.R_cam0_cam1 @ R_w_c0
-        t_c1_w = t_c0_w - R_w_c1.T @ CAMState.t_cam0_cam1
+        # Cam1 respect to IMU
+        R_cam1_imu = self.R_cam1_imu
+        t_cam1_imu = self.t_cam1_imu
+
+        # IMu Rotation matrix
+        q_object = R.from_quat(self.state_server.imu_state.orientation)
+        R_t = q_object.as_matrix()
+
+        t_c1_w = self.state_server.imu_state.position + R_t@t_cam1_imu
+        R_camera1_world = R_t@R_cam1_imu
+        R_w_c1 = R_camera1_world
+
 
         # 3d feature position in the world frame.
         # And its observation with the stereo cameras.
@@ -581,8 +592,8 @@ class MSCKF(object):
 
         # Convert the feature position from the world frame to
         # the cam0 and cam1 frame.
-        p_c0 = R_w_c0 @ (p_w - t_c0_w)
-        p_c1 = R_w_c1 @ (p_w - t_c1_w)
+        p_c0 = R_w_c0.T @ (p_w - t_c0_w)
+        p_c1 = R_w_c1.T @ (p_w - t_c1_w)
 
         # Compute the Jacobians.
         dz_dpc0 = np.zeros((4, 3))
@@ -599,23 +610,24 @@ class MSCKF(object):
 
         dpc0_dxc = np.zeros((3, 6))
         dpc0_dxc[:, :3] = skew(p_c0)
-        dpc0_dxc[:, 3:] = -R_w_c0
+        dpc0_dxc[:, 3:] = -R_w_c0.T
 
         dpc1_dxc = np.zeros((3, 6))
-        dpc1_dxc[:, :3] = CAMState.R_cam0_cam1 @ skew(p_c0)
-        dpc1_dxc[:, 3:] = -R_w_c1
+        dpc1_dxc[:, :3] = skew(p_c1) 
+        dpc1_dxc[:, 3:] = -R_w_c1.T
 
-        dpc0_dpg = R_w_c0
-        dpc1_dpg = R_w_c1
+        dpc0_dpg = R_w_c0.T
+        dpc1_dpg = R_w_c1.T
 
         H_x = dz_dpc0 @ dpc0_dxc + dz_dpc1 @ dpc1_dxc   # shape: (4, 6)
         H_f = dz_dpc0 @ dpc0_dpg + dz_dpc1 @ dpc1_dpg   # shape: (4, 3)
+        
 
         # Modifty the measurement Jacobian to ensure observability constrain.
         A = H_x   # shape: (4, 6)
         u = np.zeros(6)
-        u[:3] = to_rotation(cam_state.orientation_null) @ IMUState.gravity
-        u[3:] = skew(p_w - cam_state.position_null) @ IMUState.gravity
+        u[:3] = to_rotation(cam_state.orientation_null).T @ IMUState.gravity
+        u[3:] = -skew(p_w - cam_state.position_null) @ IMUState.gravity
 
         H_x = A - (A @ u)[:, None] * u / (u @ u)
         H_f = -H_x[:4, 3:6]
@@ -678,30 +690,62 @@ class MSCKF(object):
         """
         Section III.B: by stacking multiple observations, we can compute the residuals in equation (6) in "MSCKF" paper 
         """
-        # Check if H and r are empty
-        ...
+        # Optionally thin H if rows > columns
+        if H.shape[0] > H.shape[1]:
+            Q, R_aux = np.linalg.qr(H, mode='reduced')
+            H_thin = R_aux
+            r_thin = Q.T @ r
+        else:
+            H_thin = H
+            r_thin = r
 
-        # Decompose the final Jacobian matrix to reduce computational
-        # complexity.
-        ...
+        P = self.state_server.state_cov
+        R_cov = self.config.observation_noise * np.eye(H_thin.shape[0])
 
-        # Compute the Kalman gain.
-        ...
+        S = H_thin @ P @ H_thin.T + R_cov
 
-        # Compute the error of the state.
-        ...
-        
-        # Update the IMU state.
-        ...
+        # Solve for Kalman gain
+        K = np.linalg.solve(S, H_thin @ P).T
 
-        # Update the camera states.
-        ...
+            # Compute the error state delta_x
+        delta_x = K @ r_thin
 
-        # Update state covariance.
-        ...
+        # Update IMU state
+        delta_x_imu = delta_x[:21]
 
-        # Fix the covariance to be symmetric
-        ...
+        if (np.linalg.norm(delta_x_imu[6:9]) > 0.5 or np.linalg.norm(delta_x_imu[12:15]) > 1.0):
+            print("[WARN] delta velocity:", np.linalg.norm(delta_x_imu[6:9]))
+            print("[WARN] delta position:", np.linalg.norm(delta_x_imu[12:15]))
+            print("[WARN] Large state correction detected.")
+
+        dq_imu = small_angle_quaternion(delta_x_imu[0:3])
+        self.state_server.imu_state.orientation = quaternion_multiplication(
+             self.state_server.imu_state.orientation, dq_imu)
+        self.state_server.imu_state.gyro_bias += delta_x_imu[3:6]
+        self.state_server.imu_state.velocity += delta_x_imu[6:9]
+        self.state_server.imu_state.acc_bias += delta_x_imu[9:12]
+        self.state_server.imu_state.position += delta_x_imu[12:15]
+
+        dq_extrinsic = small_angle_quaternion(delta_x_imu[15:18])
+        R_extrinsic = R.from_quat(dq_extrinsic).as_matrix()
+        self.state_server.imu_state.R_cam0_imu = self.state_server.imu_state.R_cam0_imu @ R_extrinsic
+        self.state_server.imu_state.t_cam0_imu += delta_x_imu[18:21]
+#
+        ## Update each camera state
+        for i, (cam_id, cam_state) in enumerate(self.state_server.cam_states.items()):
+            delta_x_cam = delta_x[21 + 6*i : 21 + 6*(i+1)]
+            dq_cam = small_angle_quaternion(delta_x_cam[0:3])
+            cam_state.orientation = quaternion_multiplication(
+                 cam_state.orientation, dq_cam)
+            cam_state.position += delta_x_cam[3:6]
+
+
+        I_KH = np.eye(K.shape[0]) - K @ H_thin
+        self.state_server.state_cov = I_KH @ P @ I_KH.T + K @ R_cov @ K.T
+
+        # Enforce symmetry
+        self.state_server.state_cov = 0.5 * (self.state_server.state_cov + self.state_server.state_cov.T)
+
 
     def gating_test(self, H, r, dof):
         P1 = H @ self.state_server.state_cov @ H.T
@@ -968,8 +1012,6 @@ class MSCKF(object):
 
         # Check the uncertainty of positions to determine if 
         # the system can be reset.
-        print("-----------------xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx------------------------")
-        print(self.state_server.state_cov.shape)
         position_x_std = np.sqrt(self.state_server.state_cov[12, 12])
         position_y_std = np.sqrt(self.state_server.state_cov[13, 13])
         position_z_std = np.sqrt(self.state_server.state_cov[14, 14])

@@ -143,7 +143,6 @@ class VIONode(Node):
             return
 
         t = self.msckf.state_server.imu_state.t_cam0_imu
-        t_aux = self.msckf.state_server.imu_state.t_imu_cam0
 
         tf_imu_cam = TransformStamped()
         tf_imu_cam.header.stamp = self.get_clock().now().to_msg()
